@@ -1,6 +1,6 @@
 {
   "name": "docegestao-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "DoceGestão Pro — Backend API",
   "main": "server.js",
   "engines": {
@@ -11,7 +11,7 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
+    "sql.js": "^1.11.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.18.3",

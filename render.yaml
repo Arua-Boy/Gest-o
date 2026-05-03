@@ -9,8 +9,8 @@ services:
       - key: NODE_ENV
         value: production
       - key: JWT_SECRET
-        generateValue: true        # Render gera automaticamente
+        generateValue: true
       - key: ADMIN_PASS
-        value: Doce@2025           # Troque após o deploy
+        value: Doce@2025
       - key: DATA_DIR
         value: /tmp

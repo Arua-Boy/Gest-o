@@ -1,497 +1,365 @@
 /**
- * DoceGestão Pro — Backend API
+ * DoceGestão Pro — Backend API v2.0
  * ─────────────────────────────────────────────────────────
- * Express + SQLite (better-sqlite3) + JWT
- * Deploy: Render.com (free tier)
+ * Express + sql.js (SQLite puro JS — sem compilação nativa)
+ * Deploy: Render.com (free tier) ✅
  * ─────────────────────────────────────────────────────────
  */
 'use strict';
 
-const express  = require('express');
-const cors     = require('cors');
-const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
-const Database = require('better-sqlite3');
+const express   = require('express');
+const cors      = require('cors');
+const bcrypt    = require('bcryptjs');
+const jwt       = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
-const path     = require('path');
-const fs       = require('fs');
+const path      = require('path');
+const fs        = require('fs');
+const initSqlJs = require('sql.js');
 
 // ── Config ────────────────────────────────────────────────
 const PORT       = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'doce-gestao-secret-change-in-production';
+const JWT_SECRET = process.env.JWT_SECRET || 'doce-secret-' + Date.now();
 const ADMIN_PASS = process.env.ADMIN_PASS || 'Doce@2025';
+const DATA_DIR   = process.env.DATA_DIR || '/tmp';
+const DB_PATH    = path.join(DATA_DIR, 'docegestao.db');
 
-// Render.com usa /tmp para dados persistentes no free tier
-// Em produção defina DATA_DIR como variável de ambiente se quiser outro local
-const DATA_DIR = process.env.DATA_DIR || '/tmp';
-const DB_PATH  = path.join(DATA_DIR, 'docegestao.db');
+// ── Banco de dados ────────────────────────────────────────
+let db;
 
-// ── Database ──────────────────────────────────────────────
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-
-// Cria tabelas
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id          TEXT PRIMARY KEY,
-    username    TEXT UNIQUE NOT NULL,
-    display_name TEXT NOT NULL,
-    role        TEXT NOT NULL CHECK(role IN ('admin','staff')),
-    password_hash TEXT NOT NULL,
-    created_at  TEXT DEFAULT (datetime('now')),
-    active      INTEGER DEFAULT 1
-  );
-
-  CREATE TABLE IF NOT EXISTS devices (
-    id          TEXT PRIMARY KEY,
-    device_name TEXT NOT NULL,
-    device_key  TEXT UNIQUE NOT NULL,
-    user_id     TEXT,
-    authorized  INTEGER DEFAULT 0,
-    last_seen   TEXT,
-    created_at  TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS products (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    category    TEXT NOT NULL,
-    cost        REAL NOT NULL DEFAULT 0,
-    sell        REAL NOT NULL DEFAULT 0,
-    stock       INTEGER NOT NULL DEFAULT 0,
-    active      INTEGER DEFAULT 1,
-    created_by  TEXT,
-    updated_at  TEXT DEFAULT (datetime('now')),
-    created_at  TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS movements (
-    id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL CHECK(type IN ('in','out')),
-    description TEXT NOT NULL,
-    value       REAL NOT NULL,
-    date        TEXT NOT NULL,
-    category    TEXT,
-    product_id  TEXT,
-    created_by  TEXT,
-    device_id   TEXT,
-    created_at  TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (product_id) REFERENCES products(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS audit_logs (
-    id          TEXT PRIMARY KEY,
-    event       TEXT NOT NULL,
-    message     TEXT NOT NULL,
-    user_id     TEXT,
-    username    TEXT,
-    device_id   TEXT,
-    ip_address  TEXT,
-    created_at  TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key         TEXT PRIMARY KEY,
-    value       TEXT
-  );
-`);
-
-// ── Seed admin padrão ─────────────────────────────────────
-function seedAdmin() {
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get('admin');
-  if (!existing) {
-    const hash = bcrypt.hashSync(ADMIN_PASS, 10);
-    db.prepare(`
-      INSERT INTO users (id, username, display_name, role, password_hash)
-      VALUES (?, 'admin', 'Administrador', 'admin', ?)
-    `).run(uuidv4(), hash);
-    console.log('✅ Admin criado com sucesso');
-  }
+function persistDb() {
+  try {
+    const data = db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch(e) { console.error('[DB] persist error:', e.message); }
 }
-seedAdmin();
+
+async function initDb() {
+  const SQL = await initSqlJs();
+  if (fs.existsSync(DB_PATH)) {
+    db = new SQL.Database(fs.readFileSync(DB_PATH));
+    console.log('DB carregado:', DB_PATH);
+  } else {
+    db = new SQL.Database();
+    console.log('DB novo:', DB_PATH);
+  }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+      display_name TEXT NOT NULL, role TEXT NOT NULL,
+      password_hash TEXT NOT NULL, created_at TEXT, active INTEGER DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS devices (
+      id TEXT PRIMARY KEY, device_name TEXT NOT NULL,
+      device_key TEXT UNIQUE NOT NULL, authorized INTEGER DEFAULT 0,
+      last_seen TEXT, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS products (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      category TEXT DEFAULT 'Outros', cost REAL DEFAULT 0,
+      sell REAL DEFAULT 0, stock INTEGER DEFAULT 0,
+      active INTEGER DEFAULT 1, created_by TEXT,
+      updated_at TEXT, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS movements (
+      id TEXT PRIMARY KEY, type TEXT NOT NULL,
+      description TEXT NOT NULL, value REAL NOT NULL,
+      date TEXT NOT NULL, category TEXT,
+      product_id TEXT, created_by TEXT,
+      device_id TEXT, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY, event TEXT NOT NULL,
+      message TEXT NOT NULL, username TEXT,
+      device_id TEXT, ip_address TEXT, created_at TEXT
+    );
+  `);
+  persistDb();
+}
+
+// ── Query helpers ─────────────────────────────────────────
+function dbAll(sql, params = []) {
+  try {
+    const stmt = db.prepare(sql);
+    stmt.bind(params);
+    const rows = [];
+    while (stmt.step()) rows.push(stmt.getAsObject());
+    stmt.free();
+    return rows;
+  } catch(e) { console.error('[DB] dbAll:', e.message); return []; }
+}
+function dbGet(sql, params = []) { return dbAll(sql, params)[0] || null; }
+function dbRun(sql, params = []) {
+  try { db.run(sql, params); persistDb(); return true; }
+  catch(e) { console.error('[DB] dbRun:', e.message); return false; }
+}
+
+const now = () => new Date().toISOString();
+const getIp = req => req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '?';
+
+function auditLog(event, message, username, deviceId, ip) {
+  dbRun('INSERT INTO audit_logs (id,event,message,username,device_id,ip_address,created_at) VALUES (?,?,?,?,?,?,?)',
+    [uuidv4(), event, message, username||null, deviceId||null, ip||null, now()]);
+}
+
+// ── Rate limit ────────────────────────────────────────────
+const loginAttempts = new Map();
+function rateLimit(req, res, next) {
+  const r = loginAttempts.get(getIp(req)) || { count:0, until:0 };
+  if (r.until > Date.now()) return res.status(429).json({ error: `Muitas tentativas. Aguarde ${Math.ceil((r.until-Date.now())/60000)} min.` });
+  next();
+}
 
 // ── Express ───────────────────────────────────────────────
 const app = express();
+app.use(cors({ origin:'*', methods:['GET','POST','PUT','DELETE','PATCH'], allowedHeaders:['Content-Type','Authorization','X-Device-Key'] }));
+app.use(express.json({ limit:'2mb' }));
 
-app.use(cors({
-  origin: '*', // Em produção, defina o domínio do seu frontend
-  methods: ['GET','POST','PUT','DELETE','PATCH'],
-  allowedHeaders: ['Content-Type','Authorization','X-Device-Key'],
-}));
-app.use(express.json({ limit: '2mb' }));
-
-// ── Helpers ───────────────────────────────────────────────
-const now = () => new Date().toISOString();
-
-function auditLog(event, message, userId, username, deviceId, ip) {
-  try {
-    db.prepare(`
-      INSERT INTO audit_logs (id, event, message, user_id, username, device_id, ip_address, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(uuidv4(), event, message, userId||null, username||null, deviceId||null, ip||null, now());
-  } catch(e) {
-    console.error('Audit log error:', e.message);
-  }
-}
-
-function getClientIp(req) {
-  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '?';
-}
-
-// ── Middlewares ───────────────────────────────────────────
-
-// Verifica JWT
+// ── Auth middlewares ──────────────────────────────────────
 function requireAuth(req, res, next) {
   const auth = req.headers['authorization'];
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Não autenticado.' });
-  try {
-    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Token inválido ou expirado.' });
-  }
+  try { req.user = jwt.verify(auth.slice(7), JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: 'Sessão expirada. Faça login novamente.' }); }
 }
-
-// Verifica se é admin
 function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Acesso negado. Apenas administradores.' });
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Acesso negado.' });
   next();
 }
-
-// Verifica se o dispositivo está autorizado
 function requireDevice(req, res, next) {
-  const deviceKey = req.headers['x-device-key'];
-  if (!deviceKey) return res.status(403).json({ error: 'Dispositivo não identificado.' });
-
-  const device = db.prepare('SELECT * FROM devices WHERE device_key = ?').get(deviceKey);
+  const key = req.headers['x-device-key'];
+  if (!key) return res.status(403).json({ error: 'Dispositivo não identificado.' });
+  const device = dbGet('SELECT * FROM devices WHERE device_key = ?', [key]);
   if (!device) return res.status(403).json({ error: 'Dispositivo desconhecido. Solicite autorização ao administrador.' });
   if (!device.authorized) return res.status(403).json({ error: 'Dispositivo aguardando autorização do administrador.' });
-
   req.device = device;
-
-  // Atualiza last_seen
-  db.prepare('UPDATE devices SET last_seen = ? WHERE device_key = ?').run(now(), deviceKey);
+  dbRun('UPDATE devices SET last_seen = ? WHERE device_key = ?', [now(), key]);
   next();
 }
 
-// Rate limiting simples em memória
-const loginAttempts = new Map();
-function rateLimit(req, res, next) {
-  const key = getClientIp(req);
-  const record = loginAttempts.get(key) || { count: 0, until: 0 };
-  if (record.until > Date.now()) {
-    const mins = Math.ceil((record.until - Date.now()) / 60000);
-    return res.status(429).json({ error: `Muitas tentativas. Aguarde ${mins} min.` });
-  }
-  next();
-}
-
-// ═══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 //  ROTAS PÚBLICAS
-// ═══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+app.get('/health', (req, res) => res.json({ status:'ok', timestamp:now() }));
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: now() });
-});
-
-// ── Registro de dispositivo (antes do login) ──────────────
 app.post('/api/devices/register', (req, res) => {
   const { deviceKey, deviceName } = req.body;
   if (!deviceKey || !deviceName) return res.status(400).json({ error: 'deviceKey e deviceName obrigatórios.' });
-
-  const existing = db.prepare('SELECT * FROM devices WHERE device_key = ?').get(deviceKey);
-  if (existing) {
-    // Retorna status atual
-    return res.json({
-      authorized: !!existing.authorized,
-      message: existing.authorized ? 'Dispositivo autorizado.' : 'Aguardando autorização do administrador.',
-    });
-  }
-
-  // Registra novo dispositivo como pendente
-  db.prepare(`
-    INSERT INTO devices (id, device_name, device_key, authorized, created_at)
-    VALUES (?, ?, ?, 0, ?)
-  `).run(uuidv4(), deviceName.slice(0,80), deviceKey, now());
-
-  auditLog('device_pending', `Novo dispositivo solicitando acesso: ${deviceName}`, null, null, null, getClientIp(req));
-
-  res.json({ authorized: false, message: 'Dispositivo registrado. Aguardando autorização do administrador.' });
+  const existing = dbGet('SELECT * FROM devices WHERE device_key = ?', [deviceKey]);
+  if (existing) return res.json({ authorized: !!existing.authorized, message: existing.authorized ? 'Autorizado.' : 'Aguardando autorização.' });
+  dbRun('INSERT INTO devices (id,device_name,device_key,authorized,created_at) VALUES (?,?,?,0,?)', [uuidv4(), deviceName.slice(0,80), deviceKey, now()]);
+  auditLog('device_pending', `Novo dispositivo: ${deviceName}`, null, null, getIp(req));
+  res.json({ authorized: false, message: 'Registrado. Aguardando autorização.' });
 });
 
-// ── Login ─────────────────────────────────────────────────
 app.post('/api/auth/login', rateLimit, async (req, res) => {
   const { username, password, deviceKey } = req.body;
-  const ip = getClientIp(req);
-
+  const ip = getIp(req);
   if (!username || !password) return res.status(400).json({ error: 'Usuário e senha obrigatórios.' });
-
-  const user = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get(username.toLowerCase().trim());
-
-  // Timing-safe: sempre faz o bcrypt mesmo se user não existe
-  const hashToCheck = user?.password_hash || '$2a$10$invalidhashtopreventtimingattacks';
-  const valid = await bcrypt.compare(password, hashToCheck);
-
+  const user = dbGet('SELECT * FROM users WHERE username = ? AND active = 1', [username.toLowerCase().trim()]);
+  const hash = user?.password_hash || '$2a$10$XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+  const valid = await bcrypt.compare(password, hash);
   if (!user || !valid) {
-    // Rate limit
-    const key = getClientIp(req);
-    const record = loginAttempts.get(key) || { count: 0, until: 0 };
-    record.count++;
-    if (record.count >= 5) record.until = Date.now() + [0,0,30000,120000,300000,900000][Math.min(record.count,5)];
-    loginAttempts.set(key, record);
-
-    auditLog('login_failed', `Login falhou: ${username}`, null, username, null, ip);
+    const key = getIp(req);
+    const r = loginAttempts.get(key) || { count:0, until:0 };
+    r.count++;
+    if (r.count >= 3) r.until = Date.now() + [0,0,30000,120000,300000,900000][Math.min(r.count,5)];
+    loginAttempts.set(key, r);
+    auditLog('login_failed', `Login falhou: ${username}`, username, null, ip);
     return res.status(401).json({ error: 'Usuário ou senha inválidos.' });
   }
-
-  // Verifica dispositivo (admin fica isento da verificação de dispositivo)
   if (user.role !== 'admin' && deviceKey) {
-    const device = db.prepare('SELECT * FROM devices WHERE device_key = ?').get(deviceKey);
+    const device = dbGet('SELECT * FROM devices WHERE device_key = ?', [deviceKey]);
     if (!device) return res.status(403).json({ error: 'Dispositivo não registrado.' });
     if (!device.authorized) return res.status(403).json({ error: 'Dispositivo aguardando autorização.' });
   }
-
-  // Limpa rate limit
-  loginAttempts.delete(getClientIp(req));
-
-  // Gera token JWT (8h)
-  const token = jwt.sign(
-    { id: user.id, username: user.username, displayName: user.display_name, role: user.role },
-    JWT_SECRET,
-    { expiresIn: '8h' }
-  );
-
-  auditLog('login_success', `${user.display_name} entrou no sistema`, user.id, user.username, null, ip);
-
-  res.json({
-    token,
-    user: { id: user.id, username: user.username, displayName: user.display_name, role: user.role },
-  });
+  loginAttempts.delete(getIp(req));
+  const token = jwt.sign({ id:user.id, username:user.username, displayName:user.display_name, role:user.role }, JWT_SECRET, { expiresIn:'8h' });
+  auditLog('login_success', `${user.display_name} entrou no sistema`, user.username, null, ip);
+  res.json({ token, user:{ id:user.id, username:user.username, displayName:user.display_name, role:user.role } });
 });
 
-// ═══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 //  ROTAS PROTEGIDAS
-// ═══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 
-// ── Produtos ──────────────────────────────────────────────
-app.get('/api/products', requireAuth, requireDevice, (req, res) => {
-  const products = db.prepare("SELECT * FROM products WHERE active = 1 ORDER BY name").all();
-  res.json(products);
-});
+// Produtos
+app.get('/api/products', requireAuth, requireDevice, (req, res) =>
+  res.json(dbAll("SELECT * FROM products WHERE active=1 ORDER BY name")));
 
 app.post('/api/products', requireAuth, requireDevice, requireAdmin, (req, res) => {
   const { name, category, cost, sell, stock } = req.body;
   if (!name) return res.status(400).json({ error: 'Nome obrigatório.' });
   const id = uuidv4();
-  db.prepare(`
-    INSERT INTO products (id, name, category, cost, sell, stock, created_by, updated_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, name, category||'Outros', cost||0, sell||0, stock||0, req.user.id, now(), now());
-  auditLog('product_create', `Produto criado: ${name}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
+  dbRun('INSERT INTO products (id,name,category,cost,sell,stock,created_by,updated_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+    [id, name, category||'Outros', cost||0, sell||0, stock||0, req.user.id, now(), now()]);
+  auditLog('product_create', `Produto criado: ${name}`, req.user.username, req.device?.id, getIp(req));
   res.json({ id, name, category, cost, sell, stock });
 });
 
 app.put('/api/products/:id', requireAuth, requireDevice, requireAdmin, (req, res) => {
   const { name, category, cost, sell, stock } = req.body;
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
-  if (!product) return res.status(404).json({ error: 'Produto não encontrado.' });
-  db.prepare(`
-    UPDATE products SET name=?, category=?, cost=?, sell=?, stock=?, updated_at=? WHERE id=?
-  `).run(name, category, cost, sell, stock, now(), req.params.id);
-  auditLog('product_update', `Produto editado: ${name}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  if (!dbGet('SELECT id FROM products WHERE id=?', [req.params.id])) return res.status(404).json({ error: 'Produto não encontrado.' });
+  dbRun('UPDATE products SET name=?,category=?,cost=?,sell=?,stock=?,updated_at=? WHERE id=?',
+    [name, category, cost, sell, stock, now(), req.params.id]);
+  auditLog('product_update', `Produto editado: ${name}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
 app.delete('/api/products/:id', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const product = db.prepare('SELECT name FROM products WHERE id = ?').get(req.params.id);
-  if (!product) return res.status(404).json({ error: 'Produto não encontrado.' });
-  db.prepare('UPDATE products SET active = 0 WHERE id = ?').run(req.params.id);
-  auditLog('product_delete', `Produto excluído: ${product.name}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  const p = dbGet('SELECT name FROM products WHERE id=?', [req.params.id]);
+  if (!p) return res.status(404).json({ error: 'Produto não encontrado.' });
+  dbRun('UPDATE products SET active=0 WHERE id=?', [req.params.id]);
+  auditLog('product_delete', `Produto excluído: ${p.name}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
-// Ajuste de estoque
 app.patch('/api/products/:id/stock', requireAuth, requireDevice, (req, res) => {
   const { stock, delta } = req.body;
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
-  if (!product) return res.status(404).json({ error: 'Produto não encontrado.' });
-
-  let newStock;
-  if (typeof delta === 'number') {
-    newStock = Math.max(0, (product.stock || 0) + delta);
-  } else if (typeof stock === 'number') {
-    newStock = Math.max(0, stock);
-  } else {
-    return res.status(400).json({ error: 'Informe stock ou delta.' });
-  }
-
-  db.prepare('UPDATE products SET stock=?, updated_at=? WHERE id=?').run(newStock, now(), req.params.id);
-  auditLog('stock_update', `Estoque "${product.name}": ${product.stock} → ${newStock}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
+  const p = dbGet('SELECT * FROM products WHERE id=?', [req.params.id]);
+  if (!p) return res.status(404).json({ error: 'Produto não encontrado.' });
+  const newStock = typeof delta === 'number' ? Math.max(0,(p.stock||0)+delta) : typeof stock === 'number' ? Math.max(0,stock) : null;
+  if (newStock === null) return res.status(400).json({ error: 'Informe stock ou delta.' });
+  dbRun('UPDATE products SET stock=?,updated_at=? WHERE id=?', [newStock, now(), req.params.id]);
+  auditLog('stock_update', `Estoque "${p.name}": ${p.stock} → ${newStock}`, req.user.username, req.device?.id, getIp(req));
   res.json({ stock: newStock });
 });
 
-// ── Movimentações ─────────────────────────────────────────
+// Movimentações
 app.get('/api/movements', requireAuth, requireDevice, (req, res) => {
-  const { type, limit = 200 } = req.query;
-  let q = 'SELECT * FROM movements';
-  const params = [];
-  if (type && type !== 'all') { q += ' WHERE type = ?'; params.push(type); }
-  q += ' ORDER BY date DESC, created_at DESC LIMIT ?';
-  params.push(parseInt(limit));
-  const movements = db.prepare(q).all(...params);
-  res.json(movements);
+  const { type, limit=200 } = req.query;
+  const lim = parseInt(limit);
+  res.json(type && type !== 'all'
+    ? dbAll('SELECT * FROM movements WHERE type=? ORDER BY date DESC, created_at DESC LIMIT ?', [type, lim])
+    : dbAll('SELECT * FROM movements ORDER BY date DESC, created_at DESC LIMIT ?', [lim]));
 });
 
 app.post('/api/movements', requireAuth, requireDevice, (req, res) => {
   const { type, description, value, date, category, productId } = req.body;
-  if (!type || !description || !value) return res.status(400).json({ error: 'Campos obrigatórios: type, description, value.' });
+  if (!type||!description||!value) return res.status(400).json({ error: 'Campos obrigatórios: type, description, value.' });
   if (!['in','out'].includes(type)) return res.status(400).json({ error: 'type deve ser "in" ou "out".' });
-
-  // Funcionário só pode registrar entradas
-  if (req.user.role === 'staff' && type === 'out') {
-    return res.status(403).json({ error: 'Funcionários só podem registrar vendas (entradas).' });
-  }
-
+  if (req.user.role === 'staff' && type === 'out') return res.status(403).json({ error: 'Funcionários só podem registrar vendas.' });
   const id = uuidv4();
-  db.prepare(`
-    INSERT INTO movements (id, type, description, value, date, category, product_id, created_by, device_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, type, description, value, date, category||null, productId||null, req.user.id, req.device?.id, now());
-
-  // Desconta estoque se produto vinculado
+  dbRun('INSERT INTO movements (id,type,description,value,date,category,product_id,created_by,device_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [id, type, description, value, date, category||null, productId||null, req.user.id, req.device?.id, now()]);
   if (productId && type === 'in') {
-    const p = db.prepare('SELECT stock FROM products WHERE id = ?').get(productId);
-    if (p && p.stock > 0) {
-      db.prepare('UPDATE products SET stock=?, updated_at=? WHERE id=?')
-        .run(Math.max(0, p.stock - 1), now(), productId);
-    }
+    const p = dbGet('SELECT stock FROM products WHERE id=?', [productId]);
+    if (p && p.stock > 0) dbRun('UPDATE products SET stock=?,updated_at=? WHERE id=?', [Math.max(0,p.stock-1), now(), productId]);
   }
-
-  auditLog('movement_create', `${type==='in'?'Entrada':'Saída'}: ${description} — R$ ${value}`,
-    req.user.id, req.user.username, req.device?.id, getClientIp(req));
-
+  auditLog('movement_create', `${type==='in'?'Entrada':'Saída'}: ${description} — R$ ${value}`, req.user.username, req.device?.id, getIp(req));
   res.json({ id, type, description, value, date, category });
 });
 
 app.delete('/api/movements/:id', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const mov = db.prepare('SELECT * FROM movements WHERE id = ?').get(req.params.id);
-  if (!mov) return res.status(404).json({ error: 'Movimentação não encontrada.' });
-  db.prepare('DELETE FROM movements WHERE id = ?').run(req.params.id);
-  auditLog('movement_delete', `Movimentação excluída: ${mov.description}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  const m = dbGet('SELECT * FROM movements WHERE id=?', [req.params.id]);
+  if (!m) return res.status(404).json({ error: 'Movimentação não encontrada.' });
+  dbRun('DELETE FROM movements WHERE id=?', [req.params.id]);
+  auditLog('movement_delete', `Movimentação excluída: ${m.description}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
-// ── Funcionários (admin only) ─────────────────────────────
-app.get('/api/users', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const users = db.prepare("SELECT id, username, display_name, role, created_at, active FROM users ORDER BY role, display_name").all();
-  res.json(users);
-});
+// Usuários
+app.get('/api/users', requireAuth, requireDevice, requireAdmin, (req, res) =>
+  res.json(dbAll("SELECT id,username,display_name,role,created_at,active FROM users ORDER BY role,display_name")));
 
 app.post('/api/users', requireAuth, requireDevice, requireAdmin, async (req, res) => {
-  const { username, displayName, password, role = 'staff' } = req.body;
-  if (!username || !displayName || !password) return res.status(400).json({ error: 'Campos obrigatórios.' });
-  if (!['admin','staff'].includes(role)) return res.status(400).json({ error: 'Role inválida.' });
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username.toLowerCase());
-  if (existing) return res.status(409).json({ error: 'Usuário já existe.' });
-  const id = uuidv4();
+  const { username, displayName, password, role='staff' } = req.body;
+  if (!username||!displayName||!password) return res.status(400).json({ error: 'Campos obrigatórios.' });
+  if (dbGet('SELECT id FROM users WHERE username=?', [username.toLowerCase()])) return res.status(409).json({ error: 'Usuário já existe.' });
   const hash = await bcrypt.hash(password, 10);
-  db.prepare(`INSERT INTO users (id, username, display_name, role, password_hash) VALUES (?, ?, ?, ?, ?)`)
-    .run(id, username.toLowerCase(), displayName, role, hash);
-  auditLog('user_create', `Funcionário criado: ${displayName} (@${username})`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
+  const id = uuidv4();
+  dbRun('INSERT INTO users (id,username,display_name,role,password_hash,created_at) VALUES (?,?,?,?,?,?)',
+    [id, username.toLowerCase(), displayName, role, hash, now()]);
+  auditLog('user_create', `Funcionário criado: ${displayName} (@${username})`, req.user.username, req.device?.id, getIp(req));
   res.json({ id, username, displayName, role });
 });
 
 app.put('/api/users/:id', requireAuth, requireDevice, requireAdmin, async (req, res) => {
   const { displayName, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  const user = dbGet('SELECT * FROM users WHERE id=?', [req.params.id]);
   if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
-  if (displayName) db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, req.params.id);
-  if (password) {
-    const hash = await bcrypt.hash(password, 10);
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.params.id);
-  }
-  auditLog('user_update', `Funcionário editado: ${displayName || user.display_name}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  if (displayName) dbRun('UPDATE users SET display_name=? WHERE id=?', [displayName, req.params.id]);
+  if (password) { const h = await bcrypt.hash(password, 10); dbRun('UPDATE users SET password_hash=? WHERE id=?', [h, req.params.id]); }
+  auditLog('user_update', `Funcionário editado: ${displayName||user.display_name}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
 app.delete('/api/users/:id', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  const user = dbGet('SELECT * FROM users WHERE id=?', [req.params.id]);
   if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
   if (user.username === 'admin') return res.status(400).json({ error: 'Não é possível remover o admin.' });
-  db.prepare('UPDATE users SET active = 0 WHERE id = ?').run(req.params.id);
-  auditLog('user_delete', `Funcionário removido: ${user.display_name}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  dbRun('UPDATE users SET active=0 WHERE id=?', [req.params.id]);
+  auditLog('user_delete', `Funcionário removido: ${user.display_name}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
-// Troca de senha (usuário logado)
 app.post('/api/auth/change-password', requireAuth, requireDevice, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Campos obrigatórios.' });
+  if (!currentPassword||!newPassword) return res.status(400).json({ error: 'Campos obrigatórios.' });
   if (newPassword.length < 6) return res.status(400).json({ error: 'Nova senha: mínimo 6 caracteres.' });
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
-  if (!await bcrypt.compare(currentPassword, user.password_hash)) {
-    return res.status(401).json({ error: 'Senha atual incorreta.' });
-  }
-  const hash = await bcrypt.hash(newPassword, 10);
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.user.id);
-  auditLog('password_change', `Senha alterada por ${req.user.username}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  const user = dbGet('SELECT * FROM users WHERE id=?', [req.user.id]);
+  if (!await bcrypt.compare(currentPassword, user.password_hash)) return res.status(401).json({ error: 'Senha atual incorreta.' });
+  const h = await bcrypt.hash(newPassword, 10);
+  dbRun('UPDATE users SET password_hash=? WHERE id=?', [h, req.user.id]);
+  auditLog('password_change', `Senha alterada por ${req.user.username}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
-// ── Dispositivos (admin only) ─────────────────────────────
-app.get('/api/devices', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const devices = db.prepare('SELECT * FROM devices ORDER BY authorized DESC, created_at DESC').all();
-  res.json(devices);
-});
+// Dispositivos
+app.get('/api/devices', requireAuth, requireDevice, requireAdmin, (req, res) =>
+  res.json(dbAll('SELECT * FROM devices ORDER BY authorized DESC, created_at DESC')));
 
 app.patch('/api/devices/:id/authorize', requireAuth, requireDevice, requireAdmin, (req, res) => {
   const { authorized } = req.body;
-  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(req.params.id);
+  const device = dbGet('SELECT * FROM devices WHERE id=?', [req.params.id]);
   if (!device) return res.status(404).json({ error: 'Dispositivo não encontrado.' });
-  db.prepare('UPDATE devices SET authorized = ? WHERE id = ?').run(authorized ? 1 : 0, req.params.id);
-  auditLog(
-    authorized ? 'device_authorized' : 'device_revoked',
-    `Dispositivo "${device.device_name}" ${authorized ? 'autorizado' : 'revogado'}`,
-    req.user.id, req.user.username, req.device?.id, getClientIp(req)
-  );
-  res.json({ ok: true });
+  dbRun('UPDATE devices SET authorized=? WHERE id=?', [authorized?1:0, req.params.id]);
+  auditLog(authorized?'device_authorized':'device_revoked',
+    `Dispositivo "${device.device_name}" ${authorized?'autorizado':'revogado'}`,
+    req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
 app.delete('/api/devices/:id', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(req.params.id);
+  const device = dbGet('SELECT * FROM devices WHERE id=?', [req.params.id]);
   if (!device) return res.status(404).json({ error: 'Dispositivo não encontrado.' });
-  db.prepare('DELETE FROM devices WHERE id = ?').run(req.params.id);
-  auditLog('device_deleted', `Dispositivo removido: ${device.device_name}`, req.user.id, req.user.username, req.device?.id, getClientIp(req));
-  res.json({ ok: true });
+  dbRun('DELETE FROM devices WHERE id=?', [req.params.id]);
+  auditLog('device_deleted', `Dispositivo removido: ${device.device_name}`, req.user.username, req.device?.id, getIp(req));
+  res.json({ ok:true });
 });
 
-// ── Audit logs (admin only) ───────────────────────────────
+// Auditoria
 app.get('/api/audit', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const { category, limit = 200 } = req.query;
-  let q = 'SELECT * FROM audit_logs';
-  const params = [];
-  if (category && category !== 'all') { q += ' WHERE event LIKE ?'; params.push(category + '%'); }
-  q += ' ORDER BY created_at DESC LIMIT ?';
-  params.push(parseInt(limit));
-  const logs = db.prepare(q).all(...params);
-  res.json(logs);
+  const { category, limit=200 } = req.query;
+  const lim = parseInt(limit);
+  res.json(category && category !== 'all'
+    ? dbAll('SELECT * FROM audit_logs WHERE event LIKE ? ORDER BY created_at DESC LIMIT ?', [category+'%', lim])
+    : dbAll('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?', [lim]));
 });
 
-// ── Dashboard summary (admin only) ───────────────────────
+// Dashboard
 app.get('/api/dashboard', requireAuth, requireDevice, requireAdmin, (req, res) => {
-  const totalIn  = db.prepare("SELECT COALESCE(SUM(value),0) as v FROM movements WHERE type='in'").get().v;
-  const totalOut = db.prepare("SELECT COALESCE(SUM(value),0) as v FROM movements WHERE type='out'").get().v;
-  const products = db.prepare("SELECT COUNT(*) as v FROM products WHERE active=1").get().v;
-  const lowStock = db.prepare("SELECT COUNT(*) as v FROM products WHERE active=1 AND stock < 5").get().v;
-  const pending  = db.prepare("SELECT COUNT(*) as v FROM devices WHERE authorized=0").get().v;
-  res.json({ totalIn, totalOut, profit: totalIn - totalOut, products, lowStock, pendingDevices: pending });
+  const totalIn  = dbGet("SELECT COALESCE(SUM(value),0) as v FROM movements WHERE type='in'")?.v || 0;
+  const totalOut = dbGet("SELECT COALESCE(SUM(value),0) as v FROM movements WHERE type='out'")?.v || 0;
+  const products = dbGet("SELECT COUNT(*) as v FROM products WHERE active=1")?.v || 0;
+  const lowStock = dbGet("SELECT COUNT(*) as v FROM products WHERE active=1 AND stock < 5")?.v || 0;
+  const pending  = dbGet("SELECT COUNT(*) as v FROM devices WHERE authorized=0")?.v || 0;
+  res.json({ totalIn, totalOut, profit: totalIn-totalOut, products, lowStock, pendingDevices: pending });
 });
 
-// ── Start ─────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🍬 DoceGestão API rodando na porta ${PORT}`);
-  console.log(`   DB: ${DB_PATH}`);
-});
+// ── Iniciar ───────────────────────────────────────────────
+async function start() {
+  await initDb();
+
+  if (!dbGet('SELECT id FROM users WHERE username=?', ['admin'])) {
+    const hash = await bcrypt.hash(ADMIN_PASS, 10);
+    dbRun('INSERT INTO users (id,username,display_name,role,password_hash,created_at) VALUES (?,?,?,?,?,?)',
+      [uuidv4(), 'admin', 'Administrador', 'admin', hash, now()]);
+    console.log('✅ Admin criado');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`🍬 DoceGestão API porta ${PORT} | DB: ${DB_PATH}`);
+  });
+}
+
+start().catch(e => { console.error('Erro fatal:', e); process.exit(1); });
