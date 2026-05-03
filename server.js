@@ -128,6 +128,24 @@ function requireAdmin(req, res, next) {
 function requireDevice(req, res, next) {
   const key = req.headers['x-device-key'];
   if (!key) return res.status(403).json({ error: 'Dispositivo não identificado.' });
+
+  // Admin: autoriza o dispositivo automaticamente
+  if (req.user?.role === 'admin') {
+    let device = dbGet('SELECT * FROM devices WHERE device_key = ?', [key]);
+    if (!device) {
+      dbRun('INSERT INTO devices (id,device_name,device_key,authorized,created_at) VALUES (?,?,?,1,?)',
+        [uuidv4(), 'PC Admin (auto-autorizado)', key, now()]);
+      device = dbGet('SELECT * FROM devices WHERE device_key = ?', [key]);
+    } else if (!device.authorized) {
+      dbRun('UPDATE devices SET authorized=1 WHERE device_key = ?', [key]);
+      device = dbGet('SELECT * FROM devices WHERE device_key = ?', [key]);
+    }
+    req.device = device;
+    dbRun('UPDATE devices SET last_seen = ? WHERE device_key = ?', [now(), key]);
+    return next();
+  }
+
+  // Funcionários precisam de autorização manual
   const device = dbGet('SELECT * FROM devices WHERE device_key = ?', [key]);
   if (!device) return res.status(403).json({ error: 'Dispositivo desconhecido. Solicite autorização ao administrador.' });
   if (!device.authorized) return res.status(403).json({ error: 'Dispositivo aguardando autorização do administrador.' });
