@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: docegestao-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true        # Render gera automaticamente
+      - key: ADMIN_PASS
+        value: Doce@2025           # Troque após o deploy
+      - key: DATA_DIR
+        value: /tmp
